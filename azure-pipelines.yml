@@ -1,0 +1,222 @@
+trigger:
+  branches:
+    include:
+      - main
+
+stages:
+  - stage: Build
+    jobs:
+      - job: 'Build'
+        displayName: Build
+
+        pool:
+          vmImage: 'ubuntu-latest'
+
+        steps:
+          - task: SonarCloudPrepare@1
+            inputs:
+              SonarCloud: 'SonarCloud'
+              organization: 'mrvengenharia'
+              scannerMode: 'CLI'
+              configMode: 'manual'
+              cliProjectKey: 'mrvengenharia_prod_acc_data_connector'
+              cliProjectName: 'prod_acc_data_connector'
+              cliSources: 'src'
+              extraProperties: |
+                sonar.sources=src
+                sonar.exclusions=**/node_modules/**
+                sonar.javascript.file.suffixes=.js,.jsx
+                sonar.javascript.lcov.reportPaths=coverage/lcov.info
+
+          - task: NodeTool@0
+            inputs:
+              versionSpec: '18.x'
+            displayName: 'Instalando Node v18.x'
+
+          - script: |
+              npm install
+              npm run build --if-present
+            displayName: Instalando Dependências e Gerando Build
+
+          - task: SonarCloudAnalyze@1
+            displayName: 'Running SonarQube analysis'
+
+          - task: SonarCloudPublish@1
+            displayName: 'Publishing SonarQube analysis'
+            inputs:
+              pollingTimeoutSec: '300'
+
+          - task: ArchiveFiles@2
+            displayName: 'Arquivando node_modules'
+            inputs:
+              rootFolderOrFile: '$(System.DefaultWorkingDirectory)/node_modules'
+              includeRootFolder: false
+              archiveType: tar
+              archiveFile: 'node_modules.tar.gz'
+              replaceExistingArchive: true
+
+          - script: |
+              rm -rf node_modules
+            displayName: Deletando node_modules
+
+          - script: |
+              rm -f README.md
+              rm -f azure-pipelines.yml
+              rm -f .DS_Store
+              rm -f .gitignore
+              rm -rf .git
+              rm -f .env.local
+            workingDirectory: $(System.DefaultWorkingDirectory)
+            displayName: Deletando arquivos README .git
+
+          - task: ArchiveFiles@2
+            displayName: 'Arquivando Arquivos de Build'
+            inputs:
+              rootFolderOrFile: '$(System.DefaultWorkingDirectory)'
+              includeRootFolder: false
+              archiveType: zip
+              archiveFile: '$(Build.ArtifactStagingDirectory)/$(Build.BuildNumber).zip'
+              replaceExistingArchive: true
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)/$(Build.BuildNumber).zip'
+              ArtifactName:  drop
+              publishLocation: 'Container'
+            displayName: 'Publicando artefato'
+
+  - stage: Deploy_QAS
+    dependsOn: Build
+    variables:
+      - group: 'KvBimAccDataConnectorQAS'
+    
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+
+    jobs:
+      - deployment: DeployOnAzure
+        displayName: Deploy App Service
+        pool:
+          vmImage: ubuntu-latest
+        environment: 'azdev-acc-data-connector-qas'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+              - task: ExtractFiles@1
+                displayName: 'Extrai Artefato'
+                inputs:
+                  archiveFilePatterns: '$(Agent.BuildDirectory)/drop/$(Build.BuildNumber).zip'
+                  destinationFolder: '$(Agent.BuildDirectory)/unzip'
+                  overwriteExistingFiles: true
+                
+              - task: qetza.replacetokens.replacetokens-task.replacetokens@3
+                displayName: 'Replace tokens in **/.env.production'
+                inputs:
+                  rootDirectory: '$(Agent.BuildDirectory)/unzip'
+                  targetFiles: '**/.env.production'
+                  encoding: 'utf-8'
+                  writeBOM: false
+                  escapeType: json
+                  verbosity: detailed
+                  tokenPrefix: '__'
+                  tokenSuffix: '__'
+                
+              - task: qetza.replacetokens.replacetokens-task.replacetokens@3
+                displayName: 'Replace tokens in **/.mrvlake-gcp.json'
+                inputs:
+                  rootDirectory: '$(Agent.BuildDirectory)/unzip'
+                  targetFiles: '**/mrvlake-gcp.json'
+                  encoding: 'utf-8'
+                  writeBOM: false
+                  escapeType: custom
+                  charsToEscape: '\n'
+                  verbosity: detailed
+                  tokenPrefix: '__'
+                  tokenSuffix: '__'
+
+              - task: ArchiveFiles@2
+                displayName: 'Arquivando arquivos do Nextjs'
+                inputs:
+                  rootFolderOrFile: '$(Agent.BuildDirectory)/unzip'
+                  includeRootFolder: false
+                  archiveType: "zip"
+                  archiveFile: $(Build.ArtifactStagingDirectory)/Nextjs-site.zip
+                  replaceExistingArchive: true
+                
+              - task: AzureWebApp@1
+                displayName: Azure Web App Deploy
+                inputs:
+                  azureSubscription: 'AzureServiceConnection-EcossistemaProducao'
+                  appType: 'webAppLinux'
+                  appName: 'accdataconnectorqas'
+                  package: $(Build.ArtifactStagingDirectory)/Nextjs-site.zip
+                  runtimeStack: 'NODE|18-lts'
+                  startUpCommand: 'npm start'
+
+  - stage: Deploy_PRD
+    dependsOn: Deploy_QAS
+    variables:
+      - group: 'KvBimAccDataConnectorPRD'
+    
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+
+    jobs:
+      - deployment: DeployOnAzure
+        displayName: Deploy App Service
+        pool:
+          vmImage: ubuntu-latest
+        environment: 'azdev-acc-data-connector-prd'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+              - task: ExtractFiles@1
+                displayName: 'Extrai Artefato'
+                inputs:
+                  archiveFilePatterns: '$(Agent.BuildDirectory)/drop/$(Build.BuildNumber).zip'
+                  destinationFolder: '$(Agent.BuildDirectory)/unzip'
+                  overwriteExistingFiles: true
+                
+              - task: qetza.replacetokens.replacetokens-task.replacetokens@3
+                displayName: 'Replace tokens in **/.env.production'
+                inputs:
+                  rootDirectory: '$(Agent.BuildDirectory)/unzip'
+                  targetFiles: '**/.env.production'
+                  encoding: 'utf-8'
+                  writeBOM: false
+                  escapeType: json
+                  verbosity: detailed
+                  tokenPrefix: '__'
+                  tokenSuffix: '__'
+                
+              - task: qetza.replacetokens.replacetokens-task.replacetokens@3
+                displayName: 'Replace tokens in **/.mrvlake-gcp.json'
+                inputs:
+                  rootDirectory: '$(Agent.BuildDirectory)/unzip'
+                  targetFiles: '**/mrvlake-gcp.json'
+                  encoding: 'utf-8'
+                  writeBOM: false
+                  escapeType: custom
+                  charsToEscape: '\n'
+                  verbosity: detailed
+                  tokenPrefix: '__'
+                  tokenSuffix: '__'
+                
+              - task: ArchiveFiles@2
+                displayName: 'Arquivando arquivos do Nextjs'
+                inputs:
+                  rootFolderOrFile: '$(Agent.BuildDirectory)/unzip'
+                  includeRootFolder: false
+                  archiveType: "zip"
+                  archiveFile: $(Build.ArtifactStagingDirectory)/Nextjs-site.zip
+                  replaceExistingArchive: true
+                
+              - task: AzureWebApp@1
+                displayName: Azure Web App Deploy
+                inputs:
+                  azureSubscription: 'AzureServiceConnection-EcossistemaProducao'
+                  appType: 'webAppLinux'
+                  appName: 'accdataconnectorprd'
+                  package: $(Build.ArtifactStagingDirectory)/Nextjs-site.zip
+                  runtimeStack: 'NODE|18-lts'
+                  startUpCommand: 'npm start'
